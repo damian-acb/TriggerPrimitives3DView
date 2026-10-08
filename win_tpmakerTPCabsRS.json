@@ -1,0 +1,70 @@
+{
+ "windows": {
+  "0": [
+   {
+    "c": -256.0,
+    "w": 48.0,
+    "m": -249.89640374295004,
+    "sig": 23.070313845900486,
+    "pen": 2.529274387588485,
+    "frac": 0.2032439125713957
+   },
+   {
+    "c": 16.0,
+    "w": 96.0,
+    "m": 0.023296734958481037,
+    "sig": 41.72243219545023,
+    "pen": 0.0,
+    "frac": 0.7198508165644968
+   }
+  ],
+  "1": [
+   {
+    "c": -224.0,
+    "w": 48.0,
+    "m": -225.11159206995063,
+    "sig": 23.300058398319948,
+    "pen": 3.0293009888327402,
+    "frac": 0.17055362376617725
+   },
+   {
+    "c": 16.0,
+    "w": 96.0,
+    "m": 9.783903144749866,
+    "sig": 37.95181439038965,
+    "pen": 0.0,
+    "frac": 0.7756491181443012
+   }
+  ]
+ },
+ "thresh": 0.1,
+ "source": {
+  "files": [
+   "AtmCosRad_FullSimTP_dune10kt_1x2x6_N50_021373_000203.h5",
+   "AtmCosRad_FullSimTP_dune10kt_1x2x6_N50_021373_000204.h5",
+   "AtmCosRad_FullSimTP_dune10kt_1x2x6_N50_021373_000205.h5",
+   "AtmCosRad_FullSimTP_dune10kt_1x2x6_N50_021373_000206.h5",
+   "AtmCosRad_FullSimTP_dune10kt_1x2x6_N50_021373_000207.h5",
+   "AtmCosRad_FullSimTP_dune10kt_1x2x6_N50_021373_000208.h5",
+   "AtmCosRad_FullSimTP_dune10kt_1x2x6_N50_021373_000209.h5",
+   "AtmCosRad_FullSimTP_dune10kt_1x2x6_N50_021373_000210.h5",
+   "AtmCosRad_FullSimTP_dune10kt_1x2x6_N50_021373_000211.h5",
+   "AtmCosRad_FullSimTP_dune10kt_1x2x6_N50_021373_000212.h5",
+   "AtmCosRad_FullSimTP_dune10kt_1x2x6_N50_021373_000213.h5",
+   "AtmCosRad_FullSimTP_dune10kt_1x2x6_N50_021373_000214.h5",
+   "AtmCosRad_FullSimTP_dune10kt_1x2x6_N50_021373_000215.h5",
+   "AtmCosRad_FullSimTP_dune10kt_1x2x6_N50_021373_000216.h5",
+   "AtmCosRad_FullSimTP_dune10kt_1x2x6_N50_021373_000217.h5",
+   "AtmCosRad_FullSimTP_dune10kt_1x2x6_N50_021373_000218.h5",
+   "AtmCosRad_FullSimTP_dune10kt_1x2x6_N50_021373_000219.h5",
+   "AtmCosRad_FullSimTP_dune10kt_1x2x6_N50_021373_000220.h5",
+   "AtmCosRad_FullSimTP_dune10kt_1x2x6_N50_021373_000221.h5",
+   "AtmCosRad_FullSimTP_dune10kt_1x2x6_N50_021373_000222.h5"
+  ],
+  "n_events": 1000,
+  "dt": {
+   "0": -160,
+   "1": -32
+  }
+ }
+}

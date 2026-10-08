@@ -1,0 +1,631 @@
+tp3d v5: 3D space points from trigger primitives (dune10kt 1x2x6)
+=================================================================
+
+Code: aiml/improved_v5/tp3d.py
+      reconstruct(tp, dataset) runs the whole chain.
+
+The reconstruction uses no MC truth. Most settings were chosen without truth (the
+chi2 model, the time-shifted sideband). The exceptions are:
+  - the v3 ADC cut values, from the truth-based ADC study in check_AtmCosRad/main.py;
+  - the five v5 settings, which were tuned with truth (allowed for this version) on
+    separate events (run 21373 files 000223-000227) and evaluated on others
+    (files 000001-000020).
+
+v5 = v3 (improved_v3, unchanged) + five changes against gaps along tracks:
+  - chain seeds (step 7f): for tracks parallel to the APA, which have no
+    unambiguous seeds;
+  - sharing limit 3 -> 10 (step 7d): for tracks parallel to one set of induction
+    wires;
+  - segment growth (step 7b): for tracks along the drift, whose long TPs give
+    sparse points;
+  - cluster-aware ADC cut (step 8): the cut no longer removes small hits on tracks
+    and showers;
+  - growth reach 6 -> 10 cm (step 7b): recovers points just beyond 6 cm (big hits,
+    sparse stretches of tracks and showers).
+
+Everything else, including all calibrations, is identical to v3. Section 7 describes
+how the gaps were diagnosed, section 8 how the settings were chosen, and section 9
+the results.
+
+1. TERMINOLOGY
+--------------
+
+TP
+    A trigger primitive: one hit on one channel. The algorithm uses its channel,
+    time_start, samples_over_threshold, time_peak (= time_start + 32 *
+    samples_to_peak, in DTS ticks; 32 ticks per ADC sample) and adc_integral.
+
+U, V, X
+    The three wire planes of an APA:
+      - U and V are the induction planes (wires at +-35.71 deg from vertical);
+      - X is the collection plane (vertical wires, fixed z).
+    Each APA has U channels 0-799, V channels 800-1599, and X channels 1600-2079
+    (x<0 face) and 2080-2559 (x>0 face).
+
+Collection TP
+    A TP on an X channel. Each 3D point is built around one collection TP,
+    which gives z (the wire position) and x (from the drift time).
+
+Candidate
+    One possible match of a collection TP with U and/or V TPs. A collection TP
+    can have several candidates.
+
+3-plane point
+    A candidate made of a U, a V and an X TP whose wires cross at the same
+    height (|h_U - h_V| < 3 cm).
+
+2-plane point
+    A candidate made of an X TP and only one induction TP. It's used only when
+    the collection TP has no 3-plane candidate. With one induction plane there
+    is no consistency test, so it is weaker.
+
+Ghost
+    A wrong combination of wires that happen to cross: geometrically valid, but
+    not hit by the same particle. Ghosts appear when several hits arrive at the
+    same time (tracks parallel to the APA, showers, several particles at the
+    same drift distance).
+
+chi2
+    The ranking score of a candidate:
+      - time agreement of each induction TP;
+      - charge agreement of each induction TP;
+      - for 3-plane candidates, the height mismatch (h_U - h_V)^2;
+      - for 2-plane candidates, a fixed penalty of 9.
+    The time and charge widths are measured, so exp(-chi2/2) is used as a
+    relative likelihood.
+
+Cluster
+    A group of TPs on neighbouring wires of the same plane (and the same X face)
+    of one APA, whose time intervals [time_start, time_start + 32 *
+    samples_over_threshold] overlap within 64 ticks. A track appears as one
+    long cluster in each plane. Induction wires count as neighbours modulo 800,
+    since they wrap around the APA frame.
+
+Seed
+    A collection TP whose point is accepted without needing neighbours. There
+    are two kinds:
+      - unique: exactly one candidate, and it is 3-plane;
+      - prob_seed: the best candidate is 3-plane and holds >= 90 % of the
+        model probability of all its candidates (step 7a).
+
+Supported point
+    A seed, a point grown from seeds through 3D neighbours, or a point bridged
+    along a straight track. Supported points are the algorithm's main output.
+
+Unsupported point
+    A collection TP that still has candidates after ghost removal, but that no
+    seed, growth or bridge reached. It keeps its best-chi2 candidate and is
+    flagged support = False. It is still in the output, but less trusted.
+
+stage
+    Output column saying how a point was accepted:
+      unique, prob_seed  seeds
+      support            grown from a neighbour within 10 cm (6 cm before v5)
+      bridge             accepted along a straight track
+      best_chi2          unsupported
+
+Time-shifted (accidental) sample
+    The same events with the induction planes moved by 30000 ticks, so every
+    match is accidental. It measures fakes without truth.
+
+    It cannot see ghosts made of real hits from the same activity. Those need
+    real-hit coincidences, which the shift destroys.
+
+ADC cut (v3)
+    Collection TPs with adc_integral below ADC_CUT_X (1300 for Simple
+    Threshold, 3100 for AbsRS) get no 3D point in the output. Induction TPs are
+    never cut.
+
+
+2. INPUT, AND THE ADC CUT
+-------------------------
+
+The TP table of one TPG algorithm (tpmakerTPCsimpleThr or tpmakerTPCabsRS) of
+the TriggerPrimitiveHDF5Dump output, with one row per TP.
+
+**v3 applies one ADC cut, on collection TPs only** (step 8):
+
+    adc_integral >= 1300  (Simple Threshold)
+    adc_integral >= 3100  (AbsRS)
+
+These are the "knee" values of the ADC study in check_AtmCosRad/main.py. There,
+about 99 % of noise and about 93 % of radiological collection TPs are below
+them, against about 29 % of the signal collection TPs, which carry less than 1 %
+of the signal collection ADC.
+
+All TPs are still used to build the 3D points. The cut only decides which points
+are kept in the output; section 6 explains why.
+
+The other charge-based selection is the charge-consistency test (step 4). It
+compares induction and collection charge with each other; it is not a
+threshold.
+
+
+3. GEOMETRY AND CALIBRATION (unchanged from v1)
+-----------------------------------------------
+
+Geometry: dunecore GDML dune10kt_v6_refactored_1x2x6.
+  - 12 APAs in 6 z columns (232.39 cm apart) and 2 rows;
+  - even APAs are the bottom row, odd APAs the top row, rotated by 180 deg;
+  - the induction wires wrap around the frame.
+
+Unroll the frame into a cylinder of circumference 2W (W = 400 x 0.57477 cm):
+s = z on the x<0 face, s = 2W - z on the x>0 face. Then each induction channel
+c is a straight helix:
+
+    c_U * DZ =  s + h * tan(theta) + aU   (mod 2W)
+    c_V * DZ = -s + h * tan(theta) + aV   (mod 2W)
+
+Here h is the height above the APA's readout end, DZ = 0.57477 cm and
+theta = 35.71 deg. One induction channel plus the collection wire's z gives h
+without ambiguity.
+
+Position of a point:
+  - x = +-(0.0025088 * time_peak + 3.00155) cm, from the drift;
+  - z = the collection wire's z;
+  - y from h and the APA row.
+
+Calibrations, all measured without truth:
+
+  timing offset dt (induction - collection peak time), calibrate.py:
+      Simple Threshold  U -384, V -224 ticks
+      AbsRS             U -160, V  -32 ticks
+                        (run 21241, 1000 events; confirmed on 5000 events of 21373)
+
+  AbsRS time windows, calibrate_windows.py, win_tpmakerTPCabsRS.json:
+      a main peak and a lobe ~8 samples earlier, each with its own window
+      (run 21373 files 000203-000222)
+
+  charge model, calibrate_charge.py, qcal_<dataset>.json:
+      median and width of ln(adc_ind / adc_X) in 12 bins of collection ADC
+      (run 21373 files 000203-000222)
+
+
+4. THE ALGORITHM, STEP BY STEP
+------------------------------
+
+Step 1. Derived quantities
+    For each TP: APA, plane, wire number and X face. Each induction TP's time is
+    moved to the collection clock: t_c = time_peak - dt[view].
+
+Step 2. Time matching
+    For each collection TP, collect the U and V TPs on the same APA whose t_c
+    falls in a window:
+
+    Simple Threshold: +-96 ticks.
+
+    AbsRS: two windows per view.
+        U: main  -80..+112 ticks, lobe -304..-208 ticks
+        V: main  -80..+112 ticks, lobe -272..-176 ticks
+    A match in the lobe gets a chi2 penalty of 2.5 (U) / 3.0 (V).
+
+Step 3. Height from each induction match
+    The helix equations give h for each matched induction TP. It must be inside
+    the APA (h <= 603 cm).
+
+Step 4. Charge consistency (Q_CUT = 2)
+    r = ln(adc_ind / adc_X) must be within 2 widths of its expected value for
+    that collection ADC. Its pull^2 is added to chi2.
+
+Step 5. Candidates
+    3-plane
+        Every (U, V) pair with |h_U - h_V| < 3 cm, with h = (h_U + h_V) / 2.
+        chi2 = ((h_U - h_V) / 1.4)^2 + time terms + charge terms.
+    2-plane
+        Only for collection TPs with no 3-plane candidate. Every single U or V
+        match is kept, with chi2 = its time + charge terms + 9.
+
+Step 6. Cluster consensus (v2, CL_FRAC = 0.35)
+    TPs are clustered in each plane (see "Cluster"). Every 3-plane candidate
+    votes for its (X cluster, U cluster, V cluster) combination.
+
+    A real track gives many triplets that all combine the same three clusters.
+    A ghost that pairs a hit of the right X cluster with hits of other U/V
+    clusters collects few votes.
+
+    In X clusters of at least 5 TPs, a 3-plane candidate is dropped if its
+    combination has fewer than 35 % of the votes of the best combination of
+    that X cluster. A collection TP always keeps at least its best-voted
+    triplet.
+
+Step 7. Ghost removal: one point per collection TP
+
+    7a) Seeds (v2: probability seeds, SEED_PROB = 0.9)
+        - unique seeds: collection TPs with exactly one candidate, which is
+          3-plane;
+        - probability seeds: collection TPs whose best candidate is 3-plane and
+          has
+
+              P_best = 1 / sum_j exp(-(chi2_j - chi2_best) / 2) >= 0.9
+
+          over all their candidates j. For two candidates this means the best
+          is better by a chi2 gap of at least 4.4.
+        Seeds are accepted best chi2 first, respecting the sharing limit (7d).
+
+    7b) Growth (v2: until nothing changes; v5: segment distance, SEG_GROWTH, and
+        reach GROW_R = 10 cm)
+        Every remaining collection TP takes its candidate closest to an accepted
+        point within 10 cm (6 cm before v5; ties broken by chi2). This is repeated until a pass
+        accepts nothing new; v1 stopped after 4 passes.
+
+        v5: a collection TP is not a point in x but covers a stretch of drift:
+        lenx = samples_over_threshold x 32 ticks x 0.0025088 cm/tick, around its
+        peak. Growth now measures the distance between those stretches: the x
+        separation minus half of both stretches (not below 0), combined with the
+        y and z separation.
+
+        On a track running along the drift, each collection wire sees one long
+        pulse (7-9 cm of drift), and the peaks of consecutive wires are 5-6 cm
+        apart even though the charge is continuous. With the peak-to-peak
+        distance, growth stalled there.
+
+    7c) Directional bridging (v2; BRIDGE_R = 30 cm, BRIDGE_PERP = 2.5 cm)
+        When growth stops, a local track direction is computed for every
+        accepted point: the principal axis of the accepted points within 8 cm.
+        It is used only where those points are linear (largest-eigenvalue
+        fraction >= 0.9, at least 4 points).
+
+        A remaining candidate up to 30 cm from such a point, and within 2.5 cm
+        of its track line, is accepted. The closest to the line is preferred,
+        then the lowest chi2.
+
+        Growth (7b) then resumes from the bridged points. 7b and 7c alternate
+        until neither accepts anything. This crosses gaps in a straight track
+        that 6 cm growth cannot jump, e.g. regions where the TPs are ambiguous,
+        an induction plane is missing, or channels are merged.
+
+    7d) Sharing limit (MAX_SHARE = 10 in v5, was 3; applied in 7a-7c)
+        No induction TP may be used by more than 10 accepted points. A track
+        running almost parallel to one set of induction wires leaves one long
+        induction TP that crosses many collection wires (up to ~60), so 3 was
+        blocking real tracks. When several
+        collection TPs compete for the last slots, the better-ranked ones get
+        them, and the others try their next candidate.
+
+    7e) Leftovers
+        Collection TPs never reached keep their best-chi2 candidate as an
+        unsupported point (support = False).
+
+    7f) Chain seeds (v5; CHAIN_R = 8 cm, CHAIN_K = 5, CHAIN_LIN = 0.9,
+        CHAIN_ROUNDS = 4)
+        After 7a-7e, take every 3-plane point (supported or best-chi2). For each
+        unsupported one, look at its neighbours within 8 cm.
+
+        If there are at least 5 of them and they lie on a straight line (largest
+        eigenvalue fraction of their spread >= 0.9), the TP keeps only that
+        candidate, which makes it a unique seed. Then 7a-7e run again. This is
+        repeated up to 4 times.
+
+        Tracks running nearly parallel to the APA plane have all their hits at
+        almost the same drift time. Every collection TP then has many equally
+        good U/V matches (median 9-169), so there are no unique or probability
+        seeds, and growth never starts. The best-chi2 guesses there are still
+        91-99 % correct and line up along the track, while ghosts scatter.
+
+
+Step 8. ADC cut on the output (v3; ADC_CUT_X, CUT_STAGE = "after";
+        v5: CUT_KEEP_CLUSTER = 10, CUT_LINK = 6 cm)
+    Points whose collection TP has adc_integral below the cut are removed from
+    the output: below 1300 for Simple Threshold, below 3100 for AbsRS.
+
+    v5: except supported points that belong to a 3D cluster of at least 10
+    supported points (points linked within 6 cm). Radiological and noise blips
+    are isolated, so they are still removed. Small hits on tracks and showers
+    (track edges, delta rays, low-charge wires) are kept; v3 removed them, which
+    left visible holes in tracks (e.g. 44 correct muon points in event 43 with
+    Simple Threshold).
+
+    Steps 1-7 run on all TPs, so the small collection TPs still act as stepping
+    stones for growth and bridging along tracks and showers. They are only
+    dropped at the end.
+
+    reconstruct(..., cut_stage="before") instead removes them before matching.
+    That is faster, but loses signal (section 6). reconstruct(..., adc_cut=None)
+    reproduces improved_v2 exactly.
+
+    reconstruct(..., seg_growth=False, chain=False, max_share=3,
+    cut_keep_cluster=None, radius=6) reproduces improved_v3 exactly (same points;
+    v5 only adds the output column lenx).
+
+
+Output: one row per collection TP with at least one candidate. The columns are:
+
+    x, y, z
+    nplanes
+    support
+    stage
+    chi2
+    iX, i0, i1 (TP indices of the X, U and V TP; -1 = plane missing)
+    adc_integral, channel, time_peak
+
+
+5. HOW THE v2 SETTINGS (unchanged in v3 and v5) WERE CHOSEN (no truth)
+---------------------------------------------------------------
+
+Tuning files: run 21373, files 000223-000242 (1000 events). The metric is the
+ADC-weighted supported fraction in time minus the same fraction in the
+time-shifted sample.
+
+  - Growth until nothing changes: no setting to choose. AbsRS supported goes
+    from 54.9 % to 61.1 % (accidental 5.7 % -> 7.2 %).
+
+  - Cluster consensus: CL_FRAC from 0.1 to 0.5 all gave the same result
+    (+0.2 points). 0.35 was kept. Most ambiguous (U, V) pairs on a track come
+    from the same U and V clusters, so votes can rarely separate them.
+
+  - Probability seeds: the time-shifted sample keeps improving as the threshold
+    gets looser, all the way down. It can't see ghosts made of real hits, so
+    looser always looks better there. The threshold was therefore set from the
+    chi2 model rather than from the scan: 90 % model probability.
+
+    For reference, AbsRS supported in time (and accidental):
+        P >= 0.8    68.9 % (8.5 %)
+        P >= 0.9    66.6 % (8.2 %)
+        P >= 0.95   65.8 % (8.1 %)
+
+  - Bridging: a 30 cm reach with a 2.5 cm corridor was best among
+    {15, 30, 60 cm} x {1.0, 1.5, 2.5 cm}.
+
+
+
+6. THE ADC CUT (v3): VALUES AND WHERE TO APPLY IT
+--------------------------------------------
+
+Values: ADC_CUT_X = 1300 (ST) / 3100 (AbsRS).
+  - These come from check_AtmCosRad/main.py, which uses truth to label TPs as
+    noise, radiological or signal. This is the only v3 setting not chosen
+    truth-free.
+  - A lighter "noise-level" cut (210 / 610) was also evaluated (table below).
+
+Where to apply it: before matching, or after the reconstruction. Evaluated with
+truth on run 21373 files 000001-000020 (1000 events). Values are % of each
+category's collection ADC that ends up in correctly matched supported points
+(signal), or in supported points at all (radiological, noise).
+
+AbsRS                         no cut   knee cut   knee cut   noise cut  noise cut
+                              (= v2)   AFTER      before     after      before
+  signal, correct supported   79.0     78.8       76.3       79.0       77.8
+  marley, supported           52.7     52.3       44.6       52.7       47.9
+  radiological, supported      9.1      5.6        3.9        9.0        8.1
+  noise, supported             6.7      3.4        2.4        5.8        5.3
+  radiological supp. TPs     150466    47705      37586     131224     123787
+  noise supported TPs         22483     1892       1395       7062       6593
+  supported TPs that are
+    correct signal (purity)   60.5 %   80.3 %     82.4 %     64.8 %     65.5 %
+
+Simple Threshold              no cut   knee cut   knee cut   noise cut  noise cut
+                              (= v2)   AFTER      before     after      before
+  signal, correct supported   82.4     82.1       79.5       82.4       81.3
+  marley, supported           59.1     58.5       50.7       59.0       56.3
+  radiological, supported     12.3     10.1        9.3       12.2       11.9
+  noise, supported             6.2      3.9        3.6        5.4        5.3
+  radiological supp. TPs     153810    83701      79477     139225     137210
+  noise supported TPs         29098     3195       3028       8890       8727
+  supported TPs that are
+    correct signal (purity)   62.5 %   74.0 %     74.3 %     65.9 %     66.0 %
+
+  - Cutting AFTER the reconstruction keeps practically all the signal: 78.8 %
+    vs 79.0 % without a cut for AbsRS, and marley 52.3 % vs 52.7 %. It removes
+    ~70 % (AbsRS) / ~45 % (ST) of the radiological points and ~92 % / ~89 % of
+    the noise points.
+  - Cutting BEFORE matching loses signal: -2.7 points of signal charge for
+    AbsRS, and marley drops from 52 % to 45 %. The small collection TPs are the
+    stepping stones that growth and bridging use to cross from one large hit to
+    the next.
+  - That's why v3 cuts after (CUT_STAGE = "after"). Cutting before is ~20 %
+    faster (see section 9). If speed ever matters more than the last few
+    percent, cut_stage="before" is available.
+
+iBDM check (data/iBDM/iDBM_FullSimTP_dune10kt_1x2x6.h5, 10 events, low-energy
+e+ e- e-, not used for any choice). Supported iBDM collection ADC:
+
+                    no cut   cut after   cut before
+  AbsRS              79.2      78.8        70.7
+  Simple Threshold   85.7      85.2        82.7
+
+  Noise supported TPs: AbsRS 66 -> 2, ST 79 -> 1.
+  Cutting after is safe for these low-energy events too; cutting before is not.
+
+
+
+7. WHY TRACKS STILL HAD GAPS IN v3 (diagnosis)
+----------------------------------------------
+
+Examined: 151 muons (cosmic and atmospheric) in 450 AtmCosRad events, AbsRS. In v3,
+75 % of their collection TPs had a correct supported point. A gap is >= 3
+consecutive TPs along the track without one. Gaps by cause (number of TPs):
+
+  candidates exist, but never reached (unsupported)   6156 TPs  (gaps up to 2 m)
+  below the ADC cut                                   1258 TPs  (sub-cm gaps)
+  all candidates removed by the charge cut             513 TPs
+  supported but wrongly matched                        469 TPs
+  no U/V match at all                                  148 TPs  (often APA edges)
+
+The long "never reached" gaps came from three track orientations:
+
+  (a) Parallel to the APA plane (dx ~ 0). All hits arrive at almost the same
+      time, so each collection TP has many equally good candidates and there
+      are no seeds. Best guesses there are 91-99 % correct. Fix: chain seeds
+      (7f).
+  (b) Parallel to one set of induction wires. One long induction TP serves up
+      to ~60 collection TPs, and the limit of 3 rejected the real track. Fix:
+      sharing limit 10 (7d).
+  (c) Along the drift direction (e.g. file 000001, event 43). Long collection TPs
+      (7-9 cm of drift each) put consecutive peaks 5-6 cm apart, at the edge of
+      the growth reach. Fix: segment growth (7b).
+
+In addition, the v3 ADC cut removed correct small hits on tracks. Fix:
+cluster-aware cut (step 8).
+
+
+8. HOW THE v5 SETTINGS WERE CHOSEN (with truth)
+-----------------------------------------------
+
+Tuning events: run 21373 files 000223-000227 (250 events), truth check as in
+section 9.
+
+  Chain seeds
+      Prototyped at 6 cm / 8 neighbours / linearity 0.95 and at 8 cm / 5 / 0.9.
+      The looser one recovers more (e.g. a muon with 202 of 399 TPs goes to
+      370), without loss of purity.
+  Sharing limit
+      3, 6, 10, unlimited: 6 or more give the same signal. 10 was kept as a
+      safety margin against ghost chains.
+  Cluster-aware cut
+      Minimum cluster size 3, 5, 10 or 20, or the plain cut. Signal ADC is the
+      same for all (~83 % AbsRS). Smaller sizes keep more small signal hits but
+      also more noise TPs (5: 11.5 noise TPs per event, 10: 9.2, 20: 7.9; plain
+      cut: 1.9). 10 was chosen as the compromise.
+  Segment growth
+      On or off (on is better for every particle type, most for Simple
+      Threshold cosmics).
+  Growth reach
+      Added after the first v5 evaluation, because a few high-ADC hits
+      (e.g. in file 000001, event 43) were left unsupported 6-12 cm from the
+      nearest supported point. Each extra 2 cm of reach recovers ~1 point of
+      signal charge for ~0.2 points of purity.
+
+      AbsRS, tuning events          6 cm   8 cm   10 cm   12 cm
+        signal, correct supported   83.3   84.5   85.3    86.1
+        signal, strictly correct    71.7   72.8   73.5    74.2
+        cosmics                     87.4   89.2   90.5    92.3
+        signal, wrongly matched      3.8    4.0    4.3     4.4
+        purity of supported ADC     94.0   93.8   93.6    93.5
+
+      Noise and the purity by TP count do not change. 10 cm was chosen: most of
+      the gain, with diminishing returns beyond.
+
+
+9. RESULTS (v5)
+---------------
+
+Truth check: run 21373 files 000001-000020 (1000 events, none used for tuning).
+Labels as in section 7 of the v3 description:
+  - noise: no TrackIDE;
+  - radiological: particle not in MCParticles;
+  - otherwise the generator label;
+  - signal = atmospherics + cosmics + marley.
+
+  correct
+      Every induction TP of the point shares a particle with the collection TP.
+  strictly correct
+      The U, V and X TPs all have the same dominant particle. Stricter inside
+      showers, where "sharing a particle" can mean the same shower.
+
+% of the category's collection ADC (TP-weighted where stated). The columns "v5
+without ..." switch off one v5 change at a time.
+
+AbsRS                                     v3      v5     v5 without:  chain   segment  share 3  plain cut  10 cm reach
+  signal, correct supported              78.8    86.9                 85.7     86.0     86.2     86.8       85.2
+  signal, strictly correct supported     65.8    72.4                 71.3     71.6     71.9     72.3       71.0
+  signal, wrongly matched supported       3.2     4.2                  4.2      4.1      4.0      4.2        3.8
+  signal TPs with a correct point (TP-w)  53.0    63.4                 62.0     63.0     62.6     58.9       61.5
+  cosmics, correct supported             81.3    90.5                 88.1     90.2     89.3     90.4       88.1
+  marley, correct supported              51.3    68.7                 54.4     68.5     68.3     68.5       67.7
+  purity of supported ADC                94.7    94.1                 94.0     94.1     94.3     94.1       94.4
+  purity of supported TPs (TP-w)         80.3    76.9                 76.6     76.9     77.1     80.1       77.1
+  radiological ADC supported              5.6     5.8                  5.8      5.8      5.8      5.8        5.6
+  noise TPs supported per event           1.9    10.3                 10.2     10.2     10.1      2.1       10.3
+
+Simple Threshold                          v3      v5     v5 without:  chain   segment  share 3  plain cut  10 cm reach
+  signal, correct supported              82.1    87.5                 86.7     87.2     86.8     87.3       86.3
+  signal, strictly correct supported     69.3    73.6                 72.8     73.6     72.9     73.4       72.5
+  signal, wrongly matched supported       5.5     6.6                  6.6      6.6      6.3      6.5        6.2
+  signal TPs with a correct point (TP-w)  54.1    65.7                 64.7     65.5     64.8     58.5       64.2
+  cosmics, correct supported             87.5    93.5                 92.2     93.3     92.5     93.3       91.5
+  marley, correct supported              57.5    72.9                 61.6     72.6     72.1     72.6       71.3
+  purity of supported ADC                91.2    90.6                 90.6     90.6     90.8     90.7       91.0
+  purity of supported TPs (TP-w)         74.0    71.0                 70.7     70.9     71.2     74.0       71.0
+  radiological ADC supported             10.1    10.3                 10.3     10.3     10.3     10.3       10.2
+  noise TPs supported per event           3.2    20.9                 20.8     20.9     20.6      3.3       21.1
+
+("without 10 cm reach" = v5 with the 6 cm reach of v3, i.e. the first v5.)
+
+v5 by category (AbsRS / Simple Threshold), % of collection ADC:
+
+                  correct supported   strictly correct   TPs with a correct point
+  atmospherics      86.1 / 86.0         67.5 / 68.2          59.9 / 62.2
+  cosmics           90.5 / 93.5         90.2 / 93.2          79.6 / 82.4
+  marley            68.7 / 72.9         68.4 / 72.7          53.3 / 58.7
+  radiological       5.2 / 10.1              -                1.2 /  2.4
+
+What the supported points are made of (v5):
+
+                                     AbsRS              Simple Threshold
+                                  by ADC   by TP        by ADC   by TP
+  correct signal                   94.1    76.9          90.6    71.0
+  wrongly matched signal            4.6    10.7           6.9    11.4
+  radiological                      1.3    10.3           2.4    14.2
+  noise                             0.1     2.1           0.1     3.4
+
+  Supported points per event: 486 (AbsRS) / 612 (ST); v3: 390 / 483.
+
+Event 43 of file 000001 (a muon along the drift, two gamma showers):
+
+                                      AbsRS                    Simple Threshold
+                                 v3    v5 (6 cm)  v5         v3    v5 (6 cm)  v5
+  muon, correct supported points  79      91       94         92      113      115
+  gamma 383 MeV                   50      51       54         59       71       75
+  gamma 105 MeV                   14      14       19         18       19       25
+  signal ADC, correct supported    -    88.8 %   91.9 %        -    90.0 %   91.9 %
+
+The marley e- in the same event (Simple Threshold): 1 (v3) -> 23 of its 26 TPs.
+What is still missed there is mostly wrongly matched proton / pi+ hits next to the
+vertex, and two large gamma hits whose candidates all fail the charge cut.
+
+iBDM events (data/iBDM/iDBM_FullSimTP_dune10kt_1x2x6.h5, 10 events), supported
+iBDM collection ADC:
+  AbsRS              78.8 % (v3) -> 91.2 %   (supported noise TPs 2 -> 55)
+  Simple Threshold   85.2 % (v3) -> 92.2 %   (supported noise TPs 1 -> 72)
+
+Truth-free cross-check (time-shifted sample, run 21373 files 000001-000101,
+5000 events). Supported points as % of collection ADC, accidental rate in
+brackets:
+  AbsRS              66.4 % (7.3 %) in v3 -> 74.8 % (11.3 %)
+  Simple Threshold   70.6 % (7.9 %) in v3 -> 76.2 % (12.0 %)
+
+Speed (one core, file 000001, ~10k TPs per event):
+  AbsRS              68 (v3) -> 78 ms/event
+  Simple Threshold   60 (v3) -> 69 ms/event
+  (the chain-seed rounds re-run the ghost removal; the 10 cm reach makes growth
+  converge in fewer passes, which is why v5 is faster than its first 6 cm
+  version, ~95 / 85 ms)
+
+Reading the numbers:
+  - v5 recovers 5-8 points of the signal charge and 10-12 points of the signal
+    hits, at nearly the same ADC purity (94.1 % against 94.7 % for AbsRS; 90.6 %
+    against 91.2 % for ST). The gain is largest where v3 left gaps:
+      - cosmics: +6 to +9 points;
+      - marley: +15 to +17 points;
+      - low-energy iBDM electrons: +7 to +12 points.
+  - Chain seeds give the largest share, then the 10 cm reach, segment growth
+    and the sharing limit.
+  - The price of the cluster-aware cut is noise: about 10 (AbsRS) / 21 (ST) noise
+    TPs per event survive inside large clusters, i.e. next to real activity.
+    They are 0.1 % of the supported charge but lower the purity by TP count from
+    80 % to 77 % (AbsRS). With the plain v3 cut instead (cut_keep_cluster=None),
+    v5 keeps almost all its signal gain in ADC and v3's TP purity, but loses the
+    small hits on tracks again.
+  - The accidental rate in the time-shifted sample rises by ~4 points, but the
+    truth check shows radiological points almost unchanged (5.6 -> 5.8 % of
+    their ADC). Most of what the shifted sample counts are induction hits of
+    real activity paired with unrelated collection hits, which do not happen in
+    time.
+
+
+10. WHAT STILL LIMITS IT
+------------------------
+
+  - Showers (atmospherics): 84-85 % correct by the loose definition, but only
+    66-67 % strictly. Inside showers several hits share drift time and particle.
+    The best next step is an induction "charge budget" (as in LArSoft's
+    SpacePointSolver): all points that use one induction TP must add up to its
+    charge.
+  - Remaining small gaps: hits whose candidates all fail the charge cut (large
+    hits, where the charge model is coarse; see improved_v4), hits with no U/V
+    match (often APA edges), and a few wrong matches.
+  - Noise next to activity is kept by the cluster-aware cut. A cut on the noise
+    TP's own shape (short, low peak) could remove it without touching signal.
+  - Speed: ~75 ms/event in Python. For real time, the candidate step and the
+    chain-seed rounds are the first to optimise (vectorise across APAs, numba,
+    or C++).

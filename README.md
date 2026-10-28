@@ -108,3 +108,38 @@ For most uses, keep only `support == True`.
 
 "Signal" = atmospheric neutrinos, cosmics and marley; the remaining supported points are mostly real
 radiological deposits above the ADC cut, a few wrong matches and the noise TPs above.
+
+### What happens to each collection TP, one particle per TP
+
+The same 1000 events (run 21373, files 000001-000020), with truth used only for the check. Each
+collection TP belongs to one particle, the one with the most electrons in it (`numElectrons` of the
+`<dataset>_TrackIDEs`), and has exactly one outcome:
+
+- **kept**: it has a supported point, and its U and V TPs both contain that particle (a missing
+  induction plane is accepted);
+- **wrong match**: it has a supported point, but the U or V TP does not contain that particle;
+- **unsupported**: it has only an unsupported point;
+- **no match**: no point, and its ADC is above the cut (no U/V candidate survived);
+- **ADC cut**: no point, and its ADC is below the cut.
+
+Share of each generator's collection-TP ADC, AbsRS / Simple Threshold, in %. Primaries are the
+generator's own particles, secondaries those made by Geant4.
+
+| | kept | wrong match | unsupported | no match | ADC cut |
+|---|---|---|---|---|---|
+| **signal** | **82.0 / 79.7** | 9.1 / 14.4 | 3.5 / 3.1 | 4.8 / 2.3 | 0.5 / 0.5 |
+| atmospherics | 79.8 / 76.0 | 11.5 / 18.0 | 3.2 / 2.8 | 4.9 / 2.5 | 0.6 / 0.6 |
+| – primary | 84.5 / 84.9 | 5.9 / 9.2 | 1.9 / 1.7 | 7.4 / 3.9 | 0.3 / 0.3 |
+| – secondary | 74.6 / 66.2 | 17.8 / 27.9 | 4.6 / 4.0 | 2.1 / 1.0 | 0.9 / 0.9 |
+| cosmics | 90.4 / 93.4 | 0.7 / 1.5 | 3.8 / 3.7 | 4.8 / 1.2 | 0.3 / 0.3 |
+| – primary | 90.5 / 93.6 | 0.6 / 1.4 | 3.8 / 3.6 | 4.8 / 1.2 | 0.3 / 0.3 |
+| – secondary | 79.3 / 72.7 | 10.1 / 18.4 | 8.2 / 7.0 | 1.1 / 0.6 | 1.3 / 1.3 |
+| marley | 68.6 / 72.8 | 1.7 / 1.4 | 23.4 / 19.7 | 4.7 / 4.5 | 1.6 / 1.6 |
+| radiological | 5.2 / 10.0 | 0.6 / 0.3 | 23.0 / 17.7 | 0.6 / 2.6 | 70.6 / 69.4 |
+
+- Weighted by true deposited energy instead of ADC, signal kept is 80.3 / 78.1 %; by number of
+  TPs, 60.5 / 62.7 % (the ADC cut removes 20 / 17 % of the signal TPs, but only 0.5 % of their ADC).
+- Purity: 88.8 / 82.6 % of the supported ADC is kept signal (73.5 / 67.8 % by number of points).
+- This is stricter than "correctly matched" in the table above (86.9 / 87.5 %), which accepts a
+  point when its U and V TPs share *any* particle with the collection TP. The difference is mostly
+  inside showers, hence the larger wrong-match share of atmospheric secondaries.

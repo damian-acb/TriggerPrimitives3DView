@@ -1,0 +1,201 @@
+tp3d v6: 3D space points from trigger primitives (dune10kt 1x2x6)
+=================================================================
+
+Code: tp3d.py, reconstruct(tp, dataset) runs the whole chain (development copy:
+aiml/improved_v6/tp3d.py). Plan written before the code: aiml/improved_v6/tp3d_v6_plan.txt.
+Scans and checks: aiml/tune_truth/E_v6/ (check_v6.py, scan_share.py, final_eval.py,
+final_eval.txt) and aiml/tune_truth/D_recovery/.
+
+The reconstruction uses no MC truth. Truth was used to choose the v6 settings and to
+score them. Signal = atmospherics + cosmics (marley is reported on its own).
+
+v6 = v5 + four changes that keep more energy:
+  1. U-V height tolerance 3.0 -> 1.25 cm (H_TOL)
+  2. charge-test rescue for long collection TPs (RESCUE_LEN = 5 cm)
+  3. promotion of unsupported points in 2D collection clusters of >= 5 TPs
+     (PROMOTE_CL = 5)
+  4. charge budget of shared induction TPs (BUDGET_Q = 0.5)
+Tried and left off (no gain): track-shaped sharing (SHARE_FREE) and cluster-level
+matching (CM_OVERLAP, CM_QCUT). New optional output: split_long (several points per
+long collection TP).
+With h_tol=3.0, rescue_len=None, promote_cl=None, budget_q=None, v6 gives exactly the
+v5 points (checked, check_v6.py).
+
+
+=====================================================================
+PART A. THE SHORT VERSION
+=====================================================================
+
+A collection wire gives z (which wire) and x (when the charge arrived). The height y
+comes from the two induction planes, U and V, whose tilted wires cross the
+collection wire at different heights.
+
+  1. Read all TPs of the event.
+  2. For each collection hit, find the U and V hits of the same APA that arrived at
+     the same time; each gives a possible height.
+  3. Keep U-V pairs that give the same height (within 1.25 cm) and whose charge fits
+     the collection charge. Each pair is a candidate 3D point; usually one is real
+     and the others are ghosts.
+     NEW: a long collection hit (a track heading toward the APA) that loses all its
+     candidates to the charge test gets them back without that test.
+  4. Accept the sure ones first (seeds).
+  5. Grow: every other hit takes its candidate nearest to an accepted point (10 cm);
+     jump small gaps along straight tracks; start chains on lined-up best guesses.
+     NEW: a U or V hit may be shared by several collection hits only while their
+     charges still add up to roughly its own charge (charge budget). A ghost that
+     reuses an induction hit already "spent" on real hits is refused.
+  6. Hits never reached keep their best guess, "unsupported".
+     NEW: an unsupported point in a group of >= 5 neighbouring collection hits
+     becomes supported.
+  7. Drop small collection hits (ADC cut) unless they sit in a large 3D cluster.
+
+Result on 1000 new events (% of atmospheric + cosmic energy in correctly matched
+supported points):  AbsRS 77.8 -> 84.4,  Simple Threshold 75.5 -> 80.2,
+with slightly higher purity.
+
+
+=====================================================================
+PART B. THE FULL VERSION
+=====================================================================
+
+B1. What did not change
+-----------------------
+Input, geometry, calibrations (timing offsets, AbsRS windows, charge model), cluster
+consensus, seeds, segment growth (10 cm), bridging, chain seeds, the sharing limit of
+10 and the cluster-aware ADC cut after the reconstruction are exactly as in v5
+(tp3d_algorithm_v5.txt, sections 1-4).
+
+B2. Change 1: h_tol 3.0 -> 1.25 cm (candidates)
+------------------------------------------------
+A 3-plane candidate needs |h_U - h_V| < h_tol. With truth, real U-V crossings agree
+within 0.4 cm for 73 % of TPs (rms 0.46 cm); ghosts are spread evenly to 3 cm. At
+1.25 cm more than half of the ghosts go and ~7 % of real crossings are lost; those
+TPs fall back to 2-plane candidates, where growth usually still finds the right one.
+Scanned: h_tol 1.0-5.0 x height resolution 0.3-3.0 (tune_truth/B_match_tol). The
+height resolution (1.4 cm) and the 2-plane penalty (9) stay.
+Cost: more radiological charge is supported (5.8 -> 8.7 % of its ADC, AbsRS).
+
+B3. Change 2: charge-test rescue (rescue_candidates)
+----------------------------------------------------
+A collection TP with drift length lenx >= 5 cm that has no candidate after the charge
+test gets its candidates rebuilt without the test (the charge pull stays in chi2).
+Output column "rescue" = True for these points.
+Why: all of the v5 "no match" energy was lost to the charge test, not to missing
+induction TPs (the owner particle was in both a U and a V TP every time). These TPs
+are long (energy-weighted typical ~35 cm of drift, ADC ~40k for AbsRS): tracks
+heading toward the APA, whose bipolar induction signal partly cancels, so the U/V
+charge is far below the model.
+Effect: no match 4.2 -> 0.6 % (AbsRS), 3.1 -> 0.9 % (ST); atmospheric primaries gain
+most. No extra radiological or noise points.
+
+B4. Change 3: cluster promotion (promote_clusters)
+--------------------------------------------------
+After the ADC cut, an unsupported point becomes supported (stage "cluster") if its
+collection TP belongs to a 2D collection cluster (tp3d.clusters) of >= 5 collection
+TPs. ~75 % of unsupported signal energy was already within 2 cm of the true height;
+growth just never reached it. Radiological deposits cover 1-2 wires and rarely pass.
+3 TPs would add ~40 % more supported radiological charge; 10 gains little.
+
+B5. Change 4: charge budget of shared induction TPs (_Share, _accept)
+--------------------------------------------------------------------
+Every accepted point uses one U and/or one V TP. Each induction TP keeps the sum of
+the collection ADC of the points using it. A new point may use an induction TP that
+already has users only if
+    pull = (ln(q_ind / sum q_X) - mu(ln sum q_X)) / sig(ln sum q_X) >= -0.5,
+with mu, sig the calibrated charge model and the sum including the new point. If not,
+that candidate is refused and the collection TP tries its next one (as with the
+sharing limit). Rescued candidates are exempt. When several TPs compete in one pass,
+the better-ranked ones are charged first.
+Why: wrong matches are the largest loss left (12-17 % of the signal energy), mostly in
+atmospheric showers, and points whose induction TPs are shared carry about twice the
+wrong-match rate of unshared ones (16-19 % vs 9 % for AbsRS). Physically one induction
+wire sees the charge of all the collection hits it pairs with; a ghost reusing it
+overdraws.
+Scan (tune_truth/E_v6/scan_share.py, files 000243-000247; kept / purity):
+    cut         AbsRS          ST
+    off        84.64/86.27    79.90/80.23
+    1.5        85.07/86.68    80.04/80.41
+    1.0        85.13/86.75    80.08/80.51
+    0.5        85.15/86.83    80.23/80.77   <- chosen
+    0.0        84.99/86.77    80.17/80.93
+   -1.0        84.76/86.74    79.85/81.02
+Tighter than 0.5 starts refusing real hits (unsupported rises). It also lowers the
+radiological and noise points (ST: -5 % radiological charge).
+Cost: time (B9).
+
+B6. Tried, left off
+-------------------
+Track-shaped sharing (SHARE_FREE, SHARE_LIN): beyond N users, the users of an
+induction TP must lie on a line. No effect for N = 1-3, linearity 0.8-0.9: with few
+users almost any set of points is a line, and induction TPs with > 3 users carry only
+~7 % of the energy.
+Cluster-level matching (cluster_match: time-span overlap and summed-charge test of the
+(X, U, V) clusters of each candidate): +-0.03 points. When it fails a candidate it
+usually fails all candidates of that TP (which then keeps them), and the vote-based
+cluster consensus already covers the rest.
+Both are in the code, off by default.
+
+B7. Optional output: split_long
+-------------------------------
+reconstruct(..., split_long=L): a collection TP with lenx > L cm becomes
+ceil(lenx / L) points spread evenly over its drift segment (time_start to
+time_start + 32 x samples_over_threshold), same y and z, each with an equal share of
+adc_integral; column "part". The total charge is unchanged. Off by default; it does
+not change which TPs are kept, only where their charge sits in 3D.
+
+B8. Results (final check, run 21373 files 000268-000287, 1000 events, never used
+before; tune_truth/E_v6/final_eval.txt)
+-------------------------------------------------------------------------------
+% of atmospheric + cosmic true energy, one particle per collection TP (README
+definition), AbsRS / Simple Threshold:
+
+                                     v5             v6
+  kept                          77.8 / 75.5    84.4 / 80.2
+  wrong match                   12.7 / 16.9    12.0 / 16.3
+  unsupported                    4.1 /  3.5     1.7 /  1.6
+  no match                       4.2 /  3.1     0.6 /  0.9
+  ADC cut                        1.2 /  1.0     1.2 /  1.0
+  purity (ADC)                  85.8 / 80.2    86.1 / 80.6
+
+  atmospherics kept             73.4 / 69.9    80.6 / 75.4
+    primaries                   80.7 / 78.4    89.0 / 84.1
+    secondaries                 66.8 / 62.4    73.0 / 67.6
+  cosmics kept                  92.4 / 94.1    97.0 / 96.4
+  marley kept (not signal)      64.9 / 67.2    83.0 / 83.6
+  radiological supported         5.8 / 10.4     8.7 / 13.6   (% of its ADC)
+  noise supported per event      9.4 / 19.9    10.6 / 20.5
+  supported points per event     426 / 537      458 / 564
+
+Position score: true height = the height of the candidate whose U and V TPs both
+contain the owner particle (loose cuts); energy of supported points within:
+                                     v5             v6
+  2 cm                          50.7 / 55.8    56.6 / 59.4
+  5 cm                          60.7 / 65.0    65.6 / 68.2
+  20 cm                         71.4 / 77.2    76.1 / 80.3
+  (true height unknown: ~8 / ~7 % of the energy, mostly inside showers)
+Wrong matches within 5 cm of the true height: 3.1 -> 2.4 % (AbsRS), 4.4 -> 3.4 % (ST)
+of the signal energy; most of the remaining wrong-match energy is really misplaced,
+not just mislabelled.
+
+iBDM (10 events, % of iBDM true energy; not used for any choice):
+                                     v5             v6
+  kept                          84.7 / 78.8    86.8 / 82.1
+  purity (ADC)                  94.3 / 86.0    93.0 / 87.1
+
+B9. Speed (one core, file 000268, 20 events)
+--------------------------------------------
+  AbsRS              v5 79 -> v6 88 ms/event
+  Simple Threshold   v5 62 -> v6 100 ms/event
+The charge budget accounts for the whole increase (without it v6 runs at 71 / 61):
+refused candidates make the acceptance loop run more passes. First thing to optimise
+if speed matters.
+
+B10. What still limits it
+-------------------------
+  - Wrong matches in atmospheric showers (12 / 16 % of the signal energy) remain the
+    largest loss, and the position score shows they are mostly real misplacements.
+    The greedy charge budget helps a little; a global solution (all points that use
+    an induction TP share its charge, solved together, as in LArSoft's
+    SpacePointSolver) is the natural next step.
+  - h_tol 1.25 lets more radiological charge through (+3 points of its ADC).
+  - The rescue is a stand-in for a charge model that depends on the TP length.

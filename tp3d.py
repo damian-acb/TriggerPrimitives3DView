@@ -82,6 +82,21 @@ v5 additions (improved_v5, see tp3d_algorithm_v5.txt), against gaps along tracks
     so small hits on tracks are no longer removed;
   - growth reach 6 -> 10 cm (GROW_R).
 These were tuned with MC truth (allowed for this version) on separate files.
+
+v6 additions (improved_v6, see tp3d_algorithm_v6.txt), more energy kept; signal = atmospherics
++ cosmics:
+  - U-V height tolerance h_tol 3.0 -> 1.25 cm (H_TOL): fewer ghost triplets;
+  - charge-test rescue (RESCUE_LEN): a long collection TP (a track toward the APA, whose
+    induction signal partly cancels) left without candidates by the charge test gets its
+    candidates without that test;
+  - cluster promotion (PROMOTE_CL): an unsupported point whose collection TP lies in a 2D
+    collection cluster of at least PROMOTE_CL collection TPs becomes supported;
+  - charge budget of shared induction TPs (BUDGET_Q, see _Share): against ghosts in
+    showers that reuse an induction TP already spent on real hits.
+Also implemented but off (no gain in the scans): track-shaped sharing (SHARE_FREE) and
+cluster-level matching (cluster_match).  Optional output: split_long_tps.
+Tuned / tested with MC truth on run 21373 files 000243-000267; evaluated on 000268-000287
+(see tp3d_algorithm_v6.txt).
 """
 import json
 from pathlib import Path
@@ -164,6 +179,9 @@ CALIB["TriggerPrimitives"] = CALIB["tpmakerTPCsimpleThr"]   # old single-product
 Q_CUT = 2.0
 MAX_SHARE = 10      # v5: was 3 (a long induction TP on a track parallel to its wires
                     # legitimately serves many collection TPs)
+# H_TOL:     max |h_U - h_V| [cm] of a 3-plane candidate (v1-v5: 3.0).  Real crossings agree
+#            within ~0.4 cm, ghosts are spread evenly, so v6 uses 1.25 cm (tuned with truth).
+H_TOL = 1.25
 
 def _event_key(name):
     """Sort key for event group names: "7" (single job) or "000001_7" (merged jobs)."""
@@ -235,7 +253,7 @@ def _h(c, s, face, view):
     return np.mod(q, 2 * W) / TAN
 
 
-def candidates(d, calib, h_tol=3.0, time_shift=0, t_tol=None, q_cut=Q_CUT):
+def candidates(d, calib, h_tol=H_TOL, time_shift=0, t_tol=None, q_cut=Q_CUT):
     """All geometrically allowed (X, U, V) combinations for every collection TP.
 
     Returns one row per candidate with the X-TP index, the U/V TP indices (-1 if
@@ -260,7 +278,8 @@ def candidates(d, calib, h_tol=3.0, time_shift=0, t_tol=None, q_cut=Q_CUT):
     if windows is None:
         windows = {v: [{"c": 0, "w": t_tol[v], "sig": sig_t[v], "pen": 0.0}] for v in (0, 1)}
     q = cal.get("q")
-    cols = ["iX", "i0", "i1", "apa", "nplanes", "h", "x", "y", "z", "chi2", "dt0", "dt1", "r0", "r1", "lenx"]
+    cols = ["iX", "i0", "i1", "apa", "nplanes", "h", "x", "y", "z", "chi2", "dt0", "dt1", "r0", "r1", "lenx",
+            "qX", "q0", "q1"]
     out = []
     for apa, g in d.groupby("apa"):
         X = g[g.view == 2]
@@ -298,7 +317,8 @@ def candidates(d, calib, h_tol=3.0, time_shift=0, t_tol=None, q_cut=Q_CUT):
                 if q_cut is not None:
                     ok &= np.abs(pull) <= q_cut
             per_view[v] = pd.DataFrame({"ix": ix[ok], f"i{v}": I.index.values[jj][ok], f"h{v}": h[ok],
-                                        f"dt{v}": (ti[jj] - tx[ix])[ok], f"r{v}": r[ok], f"c2{v}": c2[ok]})
+                                        f"dt{v}": (ti[jj] - tx[ix])[ok], f"r{v}": r[ok], f"c2{v}": c2[ok],
+                                        f"q{v}": I.adc_integral.values[jj][ok].astype(float)})
         u, vv = per_view[0], per_view[1]
         trip = u.merge(vv, on="ix")
         trip = trip[np.abs(trip.h0 - trip.h1) < h_tol]
@@ -319,6 +339,7 @@ def candidates(d, calib, h_tol=3.0, time_shift=0, t_tol=None, q_cut=Q_CUT):
         c["y"] = -Y_EDGE + c.h if apa % 2 == 0 else Y_EDGE - c.h
         c["z"] = X.z.values[c.ix]
         c["lenx"] = VD * 32 * X.samples_over_threshold.values[c.ix]     # drift length of the X TP [cm]
+        c["qX"] = X.adc_integral.values[c.ix].astype(float)
         out.append(c[cols])
     if not out:
         return pd.DataFrame(columns=cols)
@@ -328,37 +349,114 @@ def candidates(d, calib, h_tol=3.0, time_shift=0, t_tol=None, q_cut=Q_CUT):
     return c
 
 
-def _accept(ok, used, max_share):
-    """One candidate per collection TP from `ok` (sorted best first), such that no
-    induction TP ends up in more than max_share accepted points.  `used` counts
-    the accepted points per induction TP index and is updated in place.
+class _Share:
+    """Bookkeeping of the induction TPs already used by accepted points (resolve).
+
+    max_share: at most this many accepted points per induction TP (None: no limit).
+    v6 (None: off):
+    budget: {"q": charge model, "cut": n_sigma}.  Charge budget: a point may use an
+        induction TP already used by others only if the charge test still passes with the
+        summed collection ADC of all its users, pull = (ln(q_ind / sum q_X) - mu) / sig
+        >= -cut (mu, sig of the calibrated model at ln(sum q_X)).  A ghost that reuses an
+        induction TP already spent on real hits overdraws it.  Rescued candidates
+        (column "rescue") are exempt: they failed the charge test to begin with.
+    free, lin: track-shaped sharing.  From the (free + 1)-th user on, the users of an
+        induction TP plus the new point must lie on a line (largest-eigenvalue fraction
+        of their spread >= lin): one induction TP legitimately serves many collection
+        TPs on a track parallel to its wires, but not in a shower.
     """
-    if max_share is None:
+
+    def __init__(self, n, max_share=MAX_SHARE, budget=None, free=None, lin=None):
+        self.used = np.zeros(n, int)
+        self.max_share, self.budget, self.free, self.lin = max_share, budget, free, lin
+        self.plain = budget is None and free is None
+        self.qsum = np.zeros(n)
+        self.pts = {}
+
+    def q_ok(self, v, q_ind, q_sum):
+        """True where the induction charge can afford the summed collection charge."""
+        m, cut = self.budget["q"], self.budget["cut"]
+        lq = np.log(np.maximum(q_sum, 1.0))
+        pull = (np.log(q_ind / np.maximum(q_sum, 1.0)) - np.interp(lq, m["lnqX"], m["mu"][v])) \
+            / np.interp(lq, m["lnqX"], m["sig"][v])
+        return pull >= -cut
+
+    def line_ok(self, rows, j):
+        """For each row (x, y, z) and induction TP index j: are the users of j plus the row
+        on a line?  Only called for induction TPs with at least `free` users."""
+        out = np.ones(len(rows), bool)
+        xyz = rows[["x", "y", "z"]].values
+        for k, (jj, q) in enumerate(zip(j, xyz)):
+            a = np.vstack([self.pts[jj], q])
+            d = a - a.mean(0)
+            ev = np.linalg.eigvalsh(d.T @ d)
+            out[k] = ev[2] >= self.lin * max(ev.sum(), 1e-9)
+        return out
+
+    def add(self, best):
+        for v, col in enumerate(("i0", "i1")):
+            i = best[col].values
+            has = i >= 0
+            np.add.at(self.used, i[has], 1)
+            if self.budget is not None:
+                np.add.at(self.qsum, i[has], best.qX.values[has])
+            if self.free is not None:
+                for jj, q in zip(i[has], best[["x", "y", "z"]].values[has]):
+                    self.pts.setdefault(jj, []).append(q)
+
+
+def _accept(ok, sh):
+    """One candidate per collection TP from `ok` (sorted best first), respecting the
+    sharing rules of `sh` (a _Share, updated in place): no induction TP in more than
+    sh.max_share accepted points, and in v6 its charge budget and track-shaped sharing.
+    """
+    if sh.max_share is None and sh.plain:
         return ok.drop_duplicates("iX")
+    cap = sh.max_share if sh.max_share is not None else np.iinfo(int).max
+    resc = ok["rescue"].values if "rescue" in ok else np.zeros(len(ok), bool)
+    ok = ok.assign(_resc=resc)
     acc = []
     while len(ok):
         free = np.ones(len(ok), bool)
-        for col in ("i0", "i1"):
+        for v, col in enumerate(("i0", "i1")):
             i = ok[col].values
-            free &= (i < 0) | (used[np.maximum(i, 0)] < max_share)
+            has, j = i >= 0, np.maximum(i, 0)
+            free &= ~has | (sh.used[j] < cap)
+            if sh.budget is not None:
+                chk = has & (sh.used[j] > 0) & ~ok._resc.values
+                if chk.any():
+                    free[chk] &= sh.q_ok(v, ok[f"q{v}"].values[chk], sh.qsum[j[chk]] + ok.qX.values[chk])
+            if sh.free is not None:
+                chk = has & free & (sh.used[j] >= sh.free)
+                if chk.any():
+                    free[chk] &= sh.line_ok(ok[chk], j[chk])
         ok = ok[free]
         best = ok.drop_duplicates("iX")
         if len(best) == 0:
             break
-        # several collection TPs may compete for the last free slots of an induction TP:
-        # the better-ranked ones get them, the others try their next candidate
+        # several collection TPs may compete for the last free slots (or the last charge) of
+        # an induction TP: the better-ranked ones get them, the others try their next
+        # candidate.  The best-ranked one always passes (it passed the tests above).
         take = np.ones(len(best), bool)
-        for col in ("i0", "i1"):
+        for v, col in enumerate(("i0", "i1")):
             i = best[col].values
+            has, j = i >= 0, np.maximum(i, 0)
             rank = best.groupby(col).cumcount().values
-            take &= (i < 0) | (used[np.maximum(i, 0)] + rank < max_share)
+            take &= ~has | (sh.used[j] + rank < cap)
+            if sh.budget is not None:
+                cum = best.groupby(col).qX.cumsum().values
+                chk = has & (sh.used[j] + rank > 0) & ~best._resc.values
+                if chk.any():
+                    take[chk] &= sh.q_ok(v, best[f"q{v}"].values[chk], sh.qsum[j[chk]] + cum[chk])
+            if sh.free is not None:
+                # past the free users, one new user per induction TP per pass (each is
+                # line-tested against the users accepted so far)
+                take &= ~has | (rank == 0) | (sh.used[j] + rank < sh.free)
         best = best[take]
-        for col in ("i0", "i1"):
-            i = best[col].values
-            np.add.at(used, i[i >= 0], 1)
+        sh.add(best)
         acc.append(best)
         ok = ok[~ok.iX.isin(best.iX)]
-    return pd.concat(acc) if acc else ok.iloc[:0]
+    return (pd.concat(acc) if acc else ok.iloc[:0]).drop(columns="_resc")
 
 
 # --- v2 ghost-removal settings (tuned on the time-shifted sideband, see tp3d_algorithm_v2.txt) ---
@@ -398,6 +496,34 @@ GROW_R = 10.0
 CHAIN_R, CHAIN_K, CHAIN_LIN, CHAIN_ROUNDS = 8.0, 5, 0.9, 4
 CUT_KEEP_CLUSTER, CUT_LINK = 10, 6.0
 
+# --- v6 settings (tuned with truth on run 21373 files 000243-000267, see tp3d_algorithm_v6.txt) ---
+# H_TOL:    see the ghost-removal settings above (v6: 3.0 -> 1.25 cm).
+# RESCUE_LEN: a collection TP with drift length lenx >= RESCUE_LEN cm that has no candidate
+#           left after the charge test gets its candidates without it (None: off).
+# PROMOTE_CL: an unsupported point becomes supported (stage "cluster") if its collection TP
+#           is in a 2D collection cluster (clusters()) of >= PROMOTE_CL collection TPs
+#           (None: off).  Radiological blips cover 1-2 wires.
+RESCUE_LEN = 5.0
+PROMOTE_CL = 5
+# BUDGET_Q: charge budget of shared induction TPs (see _Share): n_sigma of the one-sided
+#           charge test on the summed collection ADC of all users (None: off).
+# SHARE_FREE, SHARE_LIN: track-shaped sharing (see _Share): beyond SHARE_FREE users, the
+#           users of an induction TP must lie on a line, eigenvalue fraction >= SHARE_LIN
+#           (None: off).  Both against ghosts in showers, scanned in tune_truth/E_v6
+#           (files 000243-000247): the budget is best at 0.5 (kept energy +0.5 / +0.3 points,
+#           purity +0.6 / +0.5, AbsRS / ST); the line rule had no effect (with few users
+#           almost any set of points is a line) and stays off.
+BUDGET_Q = 0.5
+SHARE_FREE, SHARE_LIN = None, 0.9
+# CM_OVERLAP, CM_QCUT: cluster-level matching (cluster_match): in X clusters of >= CL_MIN
+#           TPs, a 3-plane candidate is dropped if its U or V cluster covers less than
+#           CM_OVERLAP of the X cluster's time span, or if the summed charge of the U (V)
+#           cluster is more than CM_QCUT widths below the charge model for the X cluster's
+#           summed charge (None: that test off).  Scanned in tune_truth/E_v6: no effect
+#           (+-0.03 points; when it fails a candidate it usually fails all of that TP's, and
+#           the vote-based cluster consensus already covers the rest), so it stays off.
+CM_OVERLAP, CM_QCUT = None, None
+
 
 def clusters(d, tol=CL_TOL):
     """Cluster id per TP: connected TPs on neighbouring wires of the same plane (and X
@@ -416,6 +542,50 @@ def clusters(d, tol=CL_TOL):
     from scipy.sparse.csgraph import connected_components
     g = coo_matrix((np.ones(len(m)), (m.i.values, m.i_b.values)), shape=(len(d), len(d)))
     return connected_components(g, directed=False)[1]
+
+
+def cluster_match(c, d, calib, overlap=CM_OVERLAP, qcut=CM_QCUT, min_size=CL_MIN):
+    """v6: compare the (X, U, V) clusters of each 3-plane candidate as wholes.  Inside a
+    shower, ghosts pair a hit of one sub-cluster with hits of an unrelated sub-cluster that
+    arrives at the same time; the time span and the total charge of the clusters tell them
+    apart better than single hits.  Only for X clusters of >= min_size TPs.  A candidate
+    fails if its U or V cluster covers < overlap of the X cluster's time span (collection
+    clock), or if ln(Q_U / Q_X) of the cluster charge sums is more than qcut widths below
+    the charge model (one-sided: an induction cluster may also hold unrelated charge).
+    A collection TP whose candidates would all fail keeps them all."""
+    if (overlap is None and qcut is None) or len(c) == 0:
+        return c
+    cal = get_calib(calib)
+    m = cal.get("q")
+    cl = clusters(d)
+    t0 = d.time_start.values - (d.time_peak.values - d.tc.values)       # on the collection clock
+    t1 = t0 + 32 * d.samples_over_threshold.values
+    agg = pd.DataFrame({"cl": cl, "t0": t0, "t1": t1, "q": d.adc_integral.values.astype(float),
+                        "isX": (d.view == 2).values}).groupby("cl").agg(
+        t0=("t0", "min"), t1=("t1", "max"), q=("q", "sum"), nX=("isX", "sum"))
+    pos = pd.Series(np.arange(len(d)), index=d.index)
+    t = (c.nplanes == 3).values
+    cX = cl[pos.reindex(c.iX).values]
+    big = t & (agg.nX.reindex(cX).values >= min_size)
+    if not big.any():
+        return c
+    X = agg.reindex(cX[big])
+    bad = np.zeros(big.sum(), bool)
+    for v, col in enumerate(("i0", "i1")):
+        I = agg.reindex(cl[pos.reindex(c[col].values[big]).values])
+        if overlap is not None:
+            cov = (np.minimum(X.t1.values, I.t1.values) - np.maximum(X.t0.values, I.t0.values)) \
+                / np.maximum(X.t1.values - X.t0.values, 1)
+            bad |= cov < overlap
+        if qcut is not None and m is not None:
+            lq = np.log(X.q.values)
+            pull = (np.log(I.q.values / X.q.values) - np.interp(lq, m["lnqX"], m["mu"][v])) \
+                / np.interp(lq, m["lnqX"], m["sig"][v])
+            bad |= pull < -qcut
+    fail = np.zeros(len(c), bool)
+    fail[np.flatnonzero(big)[bad]] = True
+    all_fail = pd.Series(fail).groupby(c.iX.values).transform("all").values
+    return c[~fail | all_fail]
 
 
 def cluster_consensus(c, d, frac=CL_FRAC, min_size=CL_MIN):
@@ -463,7 +633,7 @@ def _directions(pts, nb=BRIDGE_NB, k=12):
     return evec[:, :, 2], lin, n[:, 0]
 
 
-def _bridge(rest, chosen, used, max_share, r=BRIDGE_R, perp=BRIDGE_PERP, lin_min=BRIDGE_LIN):
+def _bridge(rest, chosen, sh, r=BRIDGE_R, perp=BRIDGE_PERP, lin_min=BRIDGE_LIN):
     """Candidates of `rest` that continue a locally straight track of `chosen`."""
     pts = chosen[["x", "y", "z"]].values
     direc, lin, n = _directions(pts)
@@ -484,7 +654,7 @@ def _bridge(rest, chosen, used, max_share, r=BRIDGE_R, perp=BRIDGE_PERP, lin_min
     pd_ = np.where(okk, pd_, np.inf)
     rest = rest.assign(dperp=pd_.min(1))
     ok = rest[rest.dperp <= perp].sort_values(["dperp", "chi2"])
-    return _accept(ok, used, max_share).drop(columns="dperp")
+    return _accept(ok, sh).drop(columns="dperp")
 
 
 def _growth_dist(rest, chosen, radius, seg):
@@ -510,7 +680,7 @@ def _growth_dist(rest, chosen, radius, seg):
 
 
 def resolve(c, radius=GROW_R, n_iter=1000, max_share=MAX_SHARE, seed_prob=SEED_PROB, bridge=BRIDGE_R,
-            bridge_perp=BRIDGE_PERP, seg_growth=SEG_GROWTH):
+            bridge_perp=BRIDGE_PERP, seg_growth=SEG_GROWTH, budget=None, share_free=None, share_lin=None):
     """Choose one candidate per collection TP using 3D neighbourhood support.
 
     1. Seeds: collection TPs with exactly one 3-plane candidate ("unique"), plus, if
@@ -524,31 +694,32 @@ def resolve(c, radius=GROW_R, n_iter=1000, max_share=MAX_SHARE, seed_prob=SEED_P
     3. Bridging (if bridge is set): TPs still left take a candidate up to `bridge` cm
        from an accepted point if it lies on the local straight track through that
        point ("bridge"); then growth resumes.  2 and 3 alternate until nothing changes.
-    No induction TP may be used by more than max_share accepted points.  TPs never
+    No induction TP may be used by more than max_share accepted points; v6 adds the charge
+    budget (budget) and track-shaped sharing (share_free, share_lin), see _Share.  TPs never
     reached keep their best-chi2 candidate and are flagged support = False.
     """
     c = c.copy()
     c["ncand"] = c.groupby("iX").iX.transform("size")
-    used = np.zeros(int(max(c.i0.max(), c.i1.max(), 0)) + 1, int)
+    sh = _Share(int(max(c.i0.max(), c.i1.max(), 0)) + 1, max_share, budget, share_free, share_lin)
     seeds = c[(c.ncand == 1) & (c.nplanes == 3)].sort_values("chi2")
-    chosen = [_accept(seeds, used, max_share).assign(stage="unique")]
+    chosen = [_accept(seeds, sh).assign(stage="unique")]
     if seed_prob is not None:
         s = c[c.ncand > 1].sort_values(["iX", "chi2"])
         rel = np.exp(-(s.chi2 - s.groupby("iX").chi2.transform("min")) / 2)
         s = s.assign(prob=1 / rel.groupby(s.iX).transform("sum"))
         first = s.groupby("iX").head(1)
         g = first[(first.nplanes == 3) & (first.prob >= seed_prob) & ~first.iX.isin(chosen[0].iX)]
-        chosen.append(_accept(g.drop(columns="prob").sort_values("chi2"), used, max_share).assign(stage="prob_seed"))
+        chosen.append(_accept(g.drop(columns="prob").sort_values("chi2"), sh).assign(stage="prob_seed"))
     chosen = pd.concat(chosen)
     rest = c[~c.iX.isin(chosen.iX)]
     it = 0
     while it < n_iter and len(rest) and len(chosen):
         rest = rest.assign(dnn=_growth_dist(rest, chosen, radius, seg_growth))
-        ok = _accept(rest[rest.dnn < radius].sort_values(["dnn", "chi2"]), used, max_share)
+        ok = _accept(rest[rest.dnn < radius].sort_values(["dnn", "chi2"]), sh)
         rest = rest.drop(columns="dnn")
         stage = "support"
         if len(ok) == 0 and bridge is not None:
-            ok = _bridge(rest, chosen, used, max_share, r=bridge, perp=bridge_perp)
+            ok = _bridge(rest, chosen, sh, r=bridge, perp=bridge_perp)
             stage = "bridge"
         if len(ok) == 0:
             break
@@ -605,10 +776,73 @@ def cluster_sizes(p, link=CUT_LINK):
     return out
 
 
-def reconstruct(tp, calib, h_tol=3.0, radius=GROW_R, time_shift=0, q_cut=Q_CUT, max_share=MAX_SHARE,
+def rescue_candidates(c, d, calib, min_len=RESCUE_LEN, **kw):
+    """v6: collection TPs with drift length >= min_len cm and no candidate in c get their
+    candidates rebuilt without the charge test (q_cut=None; the charge pull stays in chi2).
+    A track heading toward the APA gives long collection TPs whose bipolar induction
+    signal partly cancels, so every match fails the charge test.  Adds the column
+    "rescue" (True for the rebuilt candidates).  min_len=None: off."""
+    c = c.assign(rescue=False)
+    if min_len is None or kw.get("q_cut") is None:
+        return c
+    X = d[d.view == 2]
+    lenx = VD * 32 * X.samples_over_threshold
+    miss = X.index[~X.index.isin(c.iX) & (lenx >= min_len).values]
+    if len(miss) == 0:
+        return c
+    c2 = candidates(d[(d.view < 2) | d.index.isin(miss)], calib, **dict(kw, q_cut=None))
+    if len(c2) == 0:
+        return c
+    return pd.concat([c, c2.assign(rescue=True)], ignore_index=True) if len(c) else c2.assign(rescue=True)
+
+
+def promote_clusters(p, d, min_size=PROMOTE_CL):
+    """v6: unsupported points whose collection TP is in a 2D collection cluster (clusters())
+    of at least min_size collection TPs become supported, with stage "cluster".  Most of
+    them already sit at the right height; growth just never reached them.  Radiological
+    deposits cover 1-2 wires and rarely pass.  min_size=None: off."""
+    if min_size is None or len(p) == 0:
+        return p
+    cl = clusters(d)
+    size = pd.Series(cl[(d.view == 2).values]).value_counts()
+    pos = pd.Series(np.arange(len(d)), index=d.index)
+    big = size.reindex(cl[pos.reindex(p.iX).values]).fillna(0).values >= min_size
+    up = big & ~p.support.values
+    p = p.copy()
+    p.loc[up, "support"] = True
+    p.loc[up, "stage"] = "cluster"
+    return p
+
+
+def split_long_tps(p, d, length):
+    """v6 optional output: a collection TP covering more than `length` cm of drift becomes
+    n = ceil(lenx / length) points spread evenly over its drift segment (time_start to
+    time_start + 32 * samples_over_threshold), same y and z, each with adc_integral / n.
+    Column "part" (0..n-1; 0 for unsplit points).  The charge of a long TP (e.g. ~35 cm on
+    a track toward the APA) is then placed along the track instead of at its peak.
+    length=None: off."""
+    if length is None or len(p) == 0:
+        return p
+    n = np.maximum(np.ceil(p.lenx.values / length), 1).astype(int)
+    q = p.loc[p.index.repeat(n)].copy()
+    part = np.concatenate([np.arange(k) for k in n])
+    nn = np.repeat(n, n)
+    ts = d.time_start.reindex(q.iX).values.astype(float)
+    te = ts + 32 * d.samples_over_threshold.reindex(q.iX).values
+    t = ts + (part + 0.5) / nn * (te - ts)
+    split = nn > 1
+    q.loc[split, "x"] = (np.sign(q.x.values) * (VD * t + X0))[split]
+    q["adc_integral"] = q.adc_integral.values / nn
+    q["part"] = part
+    return q.reset_index(drop=True)
+
+
+def reconstruct(tp, calib, h_tol=H_TOL, radius=GROW_R, time_shift=0, q_cut=Q_CUT, max_share=MAX_SHARE,
                 cl_frac=CL_FRAC, seed_prob=SEED_PROB, bridge=BRIDGE_R, bridge_perp=BRIDGE_PERP, n_iter=1000,
                 adc_cut="calib", cut_stage=CUT_STAGE, seg_growth=SEG_GROWTH, chain=True,
-                cut_keep_cluster=CUT_KEEP_CLUSTER):
+                cut_keep_cluster=CUT_KEEP_CLUSTER, rescue_len=RESCUE_LEN, promote_cl=PROMOTE_CL,
+                budget_q=BUDGET_Q, share_free=SHARE_FREE, share_lin=SHARE_LIN,
+                cm_overlap=CM_OVERLAP, cm_qcut=CM_QCUT, split_long=None):
     """Full chain: unique TPs -> 3D points (one per matched collection TP).
 
     calib is the TP dataset name ("tpmakerTPCsimpleThr", "tpmakerTPCabsRS",
@@ -623,16 +857,31 @@ def reconstruct(tp, calib, h_tol=3.0, radius=GROW_R, time_shift=0, q_cut=Q_CUT, 
     v5: seg_growth (drift-segment growth distance), chain (chain seeds), max_share=10 and
     cut_keep_cluster (the ADC cut spares points in 3D clusters of at least this size);
     seg_growth=False, chain=False, max_share=3, cut_keep_cluster=None, radius=6 reproduces v3.
+    v6: h_tol=1.25, rescue_len (charge-test rescue of long collection TPs, rescue_candidates)
+    and promote_cl (promote_clusters); h_tol=3.0, rescue_len=None, promote_cl=None
+    reproduces v5.  Output columns added in v6: "rescue" (the point's candidates were
+    rebuilt without the charge test) and stage "cluster" (promoted).
+    budget_q, share_free, share_lin: v6 sharing rules of induction TPs against ghosts in
+    showers (see _Share); None: off.
+    cm_overlap, cm_qcut: v6 cluster-level matching (cluster_match); None: off.
+    split_long: v6 optional output (split_long_tps): collection TPs longer than this [cm]
+    become several points along their drift segment, column "part"; None: one point per TP.
+    v5 settings: h_tol=3.0, rescue_len=None, promote_cl=None, budget_q=None.
     """
     d = prepare(tp, calib)
     if cut_stage == "before":
         d = apply_adc_cut(d, calib, adc_cut)
     c = candidates(d, calib, h_tol=h_tol, time_shift=time_shift, q_cut=q_cut)
+    c = rescue_candidates(c, d, calib, rescue_len, h_tol=h_tol, time_shift=time_shift, q_cut=q_cut)
     if len(c) == 0:
         return c
     c = cluster_consensus(c, d, frac=cl_frac)
+    c = cluster_match(c, d, calib, overlap=cm_overlap, qcut=cm_qcut)
     kw = dict(radius=radius, n_iter=n_iter, max_share=max_share, seed_prob=seed_prob, bridge=bridge,
-              bridge_perp=bridge_perp, seg_growth=seg_growth)
+              bridge_perp=bridge_perp, seg_growth=seg_growth,
+              budget=None if budget_q is None or get_calib(calib).get("q") is None
+              else {"q": get_calib(calib)["q"], "cut": budget_q},
+              share_free=share_free, share_lin=share_lin)
     p = resolve(c, **kw)
     if chain:
         p = chain_seeds(c, p, kw)
@@ -644,4 +893,5 @@ def reconstruct(tp, calib, h_tol=3.0, radius=GROW_R, time_shift=0, q_cut=Q_CUT, 
         if cut_keep_cluster is not None:
             keep |= cluster_sizes(p) >= cut_keep_cluster
         p = p[keep].reset_index(drop=True)
-    return p
+    p = promote_clusters(p, d, promote_cl).drop(columns=["qX", "q0", "q1"])
+    return split_long_tps(p, d, split_long)

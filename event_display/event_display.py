@@ -38,7 +38,7 @@ import numpy as np
 import pandas as pd
 
 HERE = Path(__file__).resolve().parent
-TP3D_DIR = HERE.parent / "tp3d_v5_release"           # folder with tp3d.py and its .json calibrations
+TP3D_DIR = HERE.parent                               # the release folder: tp3d.py and its .json calibrations
 sys.path.insert(0, str(TP3D_DIR))
 import tp3d  # noqa: E402
 

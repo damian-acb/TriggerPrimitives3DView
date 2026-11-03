@@ -20,7 +20,8 @@ v6 is v5 plus four changes that keep more of the energy (signal = atmospherics +
 On 1000 new events v6 keeps 84.4 % (AbsRS) / 80.2 % (Simple Threshold) of the atmospheric + cosmic
 energy, against 77.8 % / 75.5 % for v5, at slightly higher purity; see Performance.
 
-(The folder keeps its name `tp3d_v5_release`; the code in it is v6.)
+Versions are git tags (`v5`, `v6`, ...): `git checkout v5` gives the v5 code and files, `git checkout main`
+the latest; `git diff v5 v6` shows what changed.
 
 ## Files
 
